@@ -24,7 +24,9 @@ import pandas as pd
 import requests
 import streamlit as st
 
-BINANCE_FUTURES_KLINES_URL = "https://fapi.binance.com/fapi/v1/klines"
+BYBIT_KLINE_URL = "https://api.bybit.com/v5/market/kline"
+
+INTERVAL_MAP = {"1m": "1", "5m": "5", "15m": "15", "1h": "60"}
 
 st.set_page_config(page_title="DCA Futures Backtest", layout="wide")
 st.title("📊 DCA / Martingale Futures Stratégia Backtesztelő")
@@ -42,40 +44,55 @@ ALL_ASSETS = {
 # ---------------------------------------------------------------------
 
 def fetch_klines(symbol: str, interval: str, start_ms: int, end_ms: int, status=None) -> pd.DataFrame:
+    bybit_interval = INTERVAL_MAP.get(interval, "5")
     all_rows = []
     cur = start_ms
     while cur < end_ms:
         params = {
-            "symbol": symbol, "interval": interval,
-            "startTime": cur, "endTime": end_ms, "limit": 1500,
+            "category": "linear",
+            "symbol": symbol,
+            "interval": bybit_interval,
+            "start": cur,
+            "end": end_ms,
+            "limit": 1000,
         }
-        resp = requests.get(BINANCE_FUTURES_KLINES_URL, params=params, timeout=15)
+        resp = requests.get(BYBIT_KLINE_URL, params=params, timeout=15)
         if resp.status_code != 200:
             if status:
-                status.warning(f"⚠️ {symbol}: nem sikerült adatot lekérni ({resp.status_code}). "
-                                f"Lehet, hogy ez a szimbólum nem elérhető a Binance Futures-ön.")
+                status.warning(f"⚠️ {symbol}: nem sikerült adatot lekérni ({resp.status_code}).")
             break
-        data = resp.json()
-        if not data:
+        payload = resp.json()
+        if payload.get("retCode") != 0:
+            if status:
+                status.warning(f"⚠️ {symbol}: {payload.get('retMsg', 'ismeretlen hiba')} "
+                                f"(lehet, hogy ez a szimbólum nem elérhető a Bybit-en).")
             break
-        all_rows.extend(data)
-        cur = data[-1][0] + 1
+        rows = payload.get("result", {}).get("list", [])
+        if not rows:
+            break
+        # A Bybit legújabb->legrégebbi sorrendben adja vissza -> fordítsuk meg
+        rows = sorted(rows, key=lambda r: int(r[0]))
+        # Ha ugyanazt a szakaszt kaptuk vissza (nincs több új adat), álljunk le
+        last_ts = int(rows[-1][0])
+        if last_ts <= cur:
+            break
+        all_rows.extend(rows)
+        cur = last_ts + 1
         if status:
             progress_pct = min(100, int((cur - start_ms) / max(1, end_ms - start_ms) * 100))
             status.info(f"⏳ {symbol} adatok letöltése... ({progress_pct}%)")
-        time.sleep(0.2)
+        time.sleep(0.15)
 
     if not all_rows:
         return pd.DataFrame()
 
     df = pd.DataFrame(all_rows, columns=[
-        "open_time", "open", "high", "low", "close", "volume",
-        "close_time", "quote_volume", "trades", "taker_buy_base",
-        "taker_buy_quote", "ignore"
+        "open_time", "open", "high", "low", "close", "volume", "turnover"
     ])
-    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
+    df["open_time"] = pd.to_datetime(df["open_time"].astype(np.int64), unit="ms")
     for col in ["open", "high", "low", "close"]:
         df[col] = df[col].astype(float)
+    df = df.drop_duplicates(subset="open_time")
     return df[["open_time", "open", "high", "low", "close"]]
 
 
@@ -255,10 +272,11 @@ selected_assets = st.multiselect(
     options=list(ALL_ASSETS.keys()),
     default=["BTC", "ETH", "SOL"],
 )
-st.caption("Megjegyzés: HYPE és XMR esetében előfordulhat, hogy a Binance Futures csak korlátozott "
-           "múltra visszamenőleg (pl. listázás óta) ad adatot. Az XAG (ezüst) esetében ez különösen "
-           "igaz: a XAGUSDT kontraktus csak 2026 január eleje óta létezik a Binance Futures-ön, tehát "
-           "annál hosszabb időtávra nem lesz adat, akármennyi hónapot állítasz be lent.")
+st.caption("Az adatok forrása: Bybit nyilvános API (linear/USDT perpetual futures) - "
+           "ugyanaz a tőzsde, ahol ténylegesen kereskedsz.")
+st.caption("Megjegyzés: HYPE, XMR és XAG esetében előfordulhat, hogy csak korlátozott "
+           "múltra visszamenőleg (pl. listázás óta) van adat. Az XAG (ezüst) esetében ez "
+           "különösen igaz, mivel a kontraktus csak 2026 január eleje óta létezik.")
 
 st.header("2️⃣ Számla és pozícióméretezés")
 col_a, col_b, col_c = st.columns(3)
